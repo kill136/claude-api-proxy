@@ -7,108 +7,100 @@ export default {
         headers: {
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version, anthropic-dangerous-direct-browser-access',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version',
           'Access-Control-Max-Age': '86400',
         }
       })
     }
 
-    // 获取请求的URL和路径
-    const url = new URL(request.url)
-    
-    // 构建目标API URL - 确保使用正确的Anthropic API端点
-    const targetUrl = `https://api.anthropic.com${url.pathname}${url.search}`
-    
-    // 创建新的headers，移除可能暴露真实IP的headers
-    const newHeaders = new Headers()
-    
-    // 只复制必要的headers
-    const allowedHeaders = [
-      'content-type',
-      'authorization', 
-      'x-api-key',
-      'anthropic-version',
-      'anthropic-dangerous-direct-browser-access',
-      'user-agent'
-    ]
-    
-    // 复制允许的headers
-    for (const [key, value] of request.headers.entries()) {
-      if (allowedHeaders.includes(key.toLowerCase())) {
-        newHeaders.set(key, value)
-      }
-    }
-    
-    // 强制设置必要的headers
-    newHeaders.set('anthropic-version', '2023-06-01')
-    
-    // 移除可能暴露真实IP的headers
-    newHeaders.delete('x-forwarded-for')
-    newHeaders.delete('x-real-ip')
-    newHeaders.delete('cf-connecting-ip')
-    newHeaders.delete('x-forwarded-proto')
-    newHeaders.delete('x-forwarded-host')
-    
-    // 设置一个通用的User-Agent，避免暴露客户端信息
-    newHeaders.set('user-agent', 'CloudflareWorker/1.0')
-    
     try {
-      // 创建新的请求 - 这个请求将从CloudFlare服务器发出
-      const newRequest = new Request(targetUrl, {
+      const url = new URL(request.url)
+      
+      // 构建目标URL
+      const targetUrl = `https://api.anthropic.com${url.pathname}${url.search}`
+      
+      // 创建新的headers，完全重新构建
+      const proxyHeaders = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
+      }
+      
+      // 只保留必要的认证headers
+      const authKey = request.headers.get('x-api-key')
+      const contentType = request.headers.get('content-type')
+      const anthropicVersion = request.headers.get('anthropic-version')
+      
+      if (authKey) proxyHeaders['x-api-key'] = authKey
+      if (contentType) proxyHeaders['content-type'] = contentType
+      if (anthropicVersion) proxyHeaders['anthropic-version'] = anthropicVersion
+      
+      // 添加一些伪装headers
+      proxyHeaders['Referer'] = 'https://console.anthropic.com/'
+      proxyHeaders['Origin'] = 'https://console.anthropic.com'
+      proxyHeaders['Sec-Fetch-Dest'] = 'empty'
+      proxyHeaders['Sec-Fetch-Mode'] = 'cors'
+      proxyHeaders['Sec-Fetch-Site'] = 'same-site'
+      
+      // 创建代理请求
+      const proxyRequest = {
         method: request.method,
-        headers: newHeaders,
-        body: request.body,
-        // 重要：确保请求从CloudFlare服务器发出
-        redirect: 'follow'
-      })
+        headers: proxyHeaders,
+        body: request.body
+      }
       
-      // 发送请求到Anthropic API - 这里使用的是CloudFlare服务器的IP
-      const response = await fetch(newRequest)
+      // 发送请求到多个备用endpoint (如果主endpoint失败)
+      const endpoints = [
+        targetUrl,
+        // 可以添加更多备用endpoint
+      ]
       
-      // 读取响应内容
-      const responseBody = await response.arrayBuffer()
+      let lastError = null
       
-      // 创建新的响应headers
-      const responseHeaders = new Headers()
-      
-      // 复制响应headers（排除一些可能有问题的headers）
-      for (const [key, value] of response.headers.entries()) {
-        // 跳过一些可能有问题的headers
-        if (!['set-cookie', 'cookie'].includes(key.toLowerCase())) {
-          responseHeaders.set(key, value)
+      for (const endpoint of endpoints) {
+        try {
+          const response = await fetch(endpoint, proxyRequest)
+          
+          // 构建响应
+          const responseBody = await response.arrayBuffer()
+          
+          return new Response(responseBody, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: {
+              ...Object.fromEntries(
+                Array.from(response.headers.entries())
+                  .filter(([key]) => !['set-cookie', 'cookie'].includes(key.toLowerCase()))
+              ),
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+              'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version',
+            }
+          })
+          
+        } catch (error) {
+          lastError = error
+          console.error(`Endpoint ${endpoint} failed:`, error)
+          continue
         }
       }
       
-      // 添加CORS headers
-      responseHeaders.set('Access-Control-Allow-Origin', '*')
-      responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-      responseHeaders.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, anthropic-version, anthropic-dangerous-direct-browser-access')
-      responseHeaders.set('Access-Control-Expose-Headers', '*')
-      
-      // 创建响应
-      const newResponse = new Response(responseBody, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: responseHeaders
-      })
-      
-      return newResponse
+      throw lastError || new Error('All endpoints failed')
       
     } catch (error) {
-      console.error('Worker代理错误:', error)
+      console.error('Worker error:', error)
       
-      // 返回错误响应
-      return new Response(JSON.stringify({ 
-        error: 'Worker代理请求失败', 
-        details: error.message,
-        timestamp: new Date().toISOString()
+      return new Response(JSON.stringify({
+        error: 'Worker proxy failed',
+        message: error.message,
+        suggestion: 'Try using a custom domain instead of workers.dev'
       }), {
         status: 500,
         headers: {
           'Content-Type': 'application/json',
           'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version',
         }
       })
     }
